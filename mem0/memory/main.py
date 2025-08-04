@@ -235,50 +235,34 @@ class Memory(MemoryBase):
                 f"Invalid 'memory_type'. Please pass {MemoryType.PROCEDURAL.value} to create procedural memories."
             )
 
-        if isinstance(messages, str):
-            messages = [{"role": "user", "content": messages}]
+        
 
-        elif isinstance(messages, dict):
-            messages = [messages]
-
-        elif not isinstance(messages, list):
-            raise ValueError("messages must be str, dict, or list[dict]")
+       
 
         if agent_id is not None and memory_type == MemoryType.PROCEDURAL.value:
             results = self._create_procedural_memory(messages, metadata=processed_metadata, prompt=prompt)
             return results
 
-        if self.config.llm.config.get("enable_vision"):
-            messages = parse_vision_messages(messages, self.llm, self.config.llm.config.get("vision_details"))
-        else:
-            messages = parse_vision_messages(messages)
+        
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            future1 = executor.submit(self._add_to_vector_store, messages, processed_metadata, effective_filters, infer)
+            
             future2 = executor.submit(self._add_to_graph, messages, effective_filters)
 
-            concurrent.futures.wait([future1, future2])
+            concurrent.futures.wait([ future2])
 
-            vector_store_result = future1.result()
+            
             graph_result = future2.result()
 
-        if self.api_version == "v1.0":
-            warnings.warn(
-                "The current add API output format is deprecated. "
-                "To use the latest format, set `api_version='v1.1'`. "
-                "The current format will be removed in mem0ai 1.1.0 and later versions.",
-                category=DeprecationWarning,
-                stacklevel=2,
-            )
-            return vector_store_result
+        
 
         if self.enable_graph:
             return {
-                "results": vector_store_result,
+                
                 "relations": graph_result,
             }
 
-        return {"results": vector_store_result}
+        
 
     def _add_to_vector_store(self, messages, metadata, filters, infer):
         if not infer:
@@ -456,7 +440,7 @@ class Memory(MemoryBase):
                 filters["user_id"] = "user"
 
             data = "\n".join([msg["content"] for msg in messages if "content" in msg and msg["role"] != "system"])
-            added_entities = self.graph.add(data, filters)
+            added_entities = self.graph.add(messages, filters)
 
         return added_entities
 
@@ -659,32 +643,23 @@ class Memory(MemoryBase):
         )
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            future_memories = executor.submit(self._search_vector_store, query, effective_filters, limit, threshold)
             future_graph_entities = (
                 executor.submit(self.graph.search, query, effective_filters, limit) if self.enable_graph else None
             )
 
             concurrent.futures.wait(
-                [future_memories, future_graph_entities] if future_graph_entities else [future_memories]
+                [future_graph_entities]
             )
 
-            original_memories = future_memories.result()
+            
             graph_entities = future_graph_entities.result() if future_graph_entities else None
 
         if self.enable_graph:
-            return {"results": original_memories, "relations": graph_entities}
+            return { "relations": graph_entities}
 
-        if self.api_version == "v1.0":
-            warnings.warn(
-                "The current search API output format is deprecated. "
-                "To use the latest format, set `api_version='v1.1'`. "
-                "The current format will be removed in mem0ai 1.1.0 and later versions.",
-                category=DeprecationWarning,
-                stacklevel=2,
-            )
-            return {"results": original_memories}
         else:
-            return {"results": original_memories}
+            raise RuntimeError("Graph DB is enabled but no graph backend is configured (self.graph is None).")
+
 
     def _search_vector_store(self, query, filters, limit, threshold: Optional[float] = None):
         embeddings = self.embedding_model.embed(query, "search")

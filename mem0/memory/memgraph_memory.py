@@ -28,7 +28,13 @@ logger = logging.getLogger(__name__)
 
 class MemoryGraph:
     def __init__(self, config):
+        """Patched initialization that handles existing indexes gracefully"""
         self.config = config
+        # Import Memgraph here to avoid import issues
+        try:
+            from langchain_memgraph.graphs.memgraph import Memgraph
+        except ImportError:
+            raise ImportError("langchain_memgraph is not installed. Please install it using pip install langchain-memgraph")
         self.graph = Memgraph(
             self.config.graph_store.config.url,
             self.config.graph_store.config.username,
@@ -39,39 +45,48 @@ class MemoryGraph:
             self.config.embedder.config,
             {"enable_embeddings": True},
         )
-
         self.llm_provider = "openai_structured"
         if self.config.llm.provider:
             self.llm_provider = self.config.llm.provider
         if self.config.graph_store.llm:
             self.llm_provider = self.config.graph_store.llm.provider
-
         self.llm = LlmFactory.create(self.llm_provider, self.config.llm.config)
         self.user_id = None
-        self.threshold = 0.7
-
-        # Setup Memgraph:
+        self.threshold = -1
+        # Setup Memgraph with error handling:
         # 1. Create vector index (created Entity label on all nodes)
         # 2. Create label property index for performance optimizations
         embedding_dims = self.config.embedder.config["embedding_dims"]
-        index_info = self._fetch_existing_indexes()
-        # Create vector index if not exists
-        if not any(idx.get("index_name") == "memzero" for idx in index_info["vector_index_exists"]):
-            self.graph.query(
-            f"CREATE VECTOR INDEX memzero ON :Entity(embedding) WITH CONFIG {{'dimension': {embedding_dims}, 'capacity': 1000, 'metric': 'cos'}};"
-            )
-        # Create label+property index if not exists
-        if not any(
-            idx.get("index type") == "label+property" and idx.get("label") == "Entity"
-            for idx in index_info["index_exists"]
-        ):
-            self.graph.query("CREATE INDEX ON :Entity(user_id);")
-        # Create label index if not exists
-        if not any(
-            idx.get("index type") == "label" and idx.get("label") == "Entity"
-            for idx in index_info["index_exists"]
-        ):
-            self.graph.query("CREATE INDEX ON :Entity;")
+        create_vector_index_query = f"CREATE VECTOR INDEX memzero ON :Entity(embedding) WITH CONFIG {{'dimension': {embedding_dims}, 'capacity': 1000, 'metric': 'cos'}};"
+        try:
+            self.graph.query(create_vector_index_query, params={})
+            logger.info("Successfully created vector index 'memzero'")
+        except Exception as e:
+            if "already exists" in str(e).lower():
+                logger.info("Vector index 'memzero' already exists, skipping creation")
+            else:
+                logger.error(f"Error creating vector index: {e}")
+                raise e
+        try:
+            create_label_prop_index_query = "CREATE INDEX ON :Entity(user_id);"
+            self.graph.query(create_label_prop_index_query, params={})
+            logger.info("Successfully created label property index on :Entity(user_id)")
+        except Exception as e:
+            if "already exists" in str(e).lower():
+                logger.info("Label property index on :Entity(user_id) already exists, skipping creation")
+            else:
+                logger.error(f"Error creating label property index: {e}")
+                raise e
+        try:
+            create_label_index_query = "CREATE INDEX ON :Entity;"
+            self.graph.query(create_label_index_query, params={})
+            logger.info("Successfully created label index on :Entity")
+        except Exception as e:
+            if "already exists" in str(e).lower():
+                logger.info("Label index on :Entity already exists, skipping creation")
+            else:
+                logger.error(f"Error creating label index: {e}")
+                raise e
 
     def add(self, data, filters):
         """
@@ -81,17 +96,13 @@ class MemoryGraph:
             data (str): The data to add to the graph.
             filters (dict): A dictionary containing filters to be applied during the addition.
         """
-        entity_type_map = self._retrieve_nodes_from_data(data, filters)
-        to_be_added = self._establish_nodes_relations_from_data(data, filters, entity_type_map)
-        search_output = self._search_graph_db(node_list=list(entity_type_map.keys()), filters=filters)
-        to_be_deleted = self._get_delete_entities_from_search_output(search_output, data, filters)
-
+        
         # TODO: Batch queries with APOC plugin
         # TODO: Add more filter support
-        deleted_entities = self._delete_entities(to_be_deleted, filters)
-        added_entities = self._add_entities(to_be_added, filters, entity_type_map)
 
-        return {"deleted_entities": deleted_entities, "added_entities": added_entities}
+        added_entities = self._add_entities(filters,data)
+
+        return {"added_entities": added_entities}
 
     def search(self, query, filters, limit=100):
         """
@@ -269,70 +280,22 @@ class MemoryGraph:
         """Search similar nodes among and their respective incoming and outgoing relations."""
         result_relations = []
 
-        for node in node_list:
-            n_embedding = self.embedding_model.embed(node)
+            
 
             # Build query based on whether agent_id is provided
-            if filters.get("agent_id"):
-                cypher_query = """
-                MATCH (n:Entity {user_id: $user_id, agent_id: $agent_id})-[r]->(m:Entity)
-                WHERE n.embedding IS NOT NULL
-                WITH collect(n) AS nodes1, collect(m) AS nodes2, r
-                CALL node_similarity.cosine_pairwise("embedding", nodes1, nodes2)
-                YIELD node1, node2, similarity
-                WITH node1, node2, similarity, r
-                WHERE similarity >= $threshold
-                RETURN node1.name AS source, id(node1) AS source_id, type(r) AS relationship, id(r) AS relation_id, node2.name AS destination, id(node2) AS destination_id, similarity
-                UNION
-                MATCH (n:Entity {user_id: $user_id, agent_id: $agent_id})<-[r]-(m:Entity)
-                WHERE n.embedding IS NOT NULL
-                WITH collect(n) AS nodes1, collect(m) AS nodes2, r
-                CALL node_similarity.cosine_pairwise("embedding", nodes1, nodes2)
-                YIELD node1, node2, similarity
-                WITH node1, node2, similarity, r
-                WHERE similarity >= $threshold
-                RETURN node2.name AS source, id(node2) AS source_id, type(r) AS relationship, id(r) AS relation_id, node1.name AS destination, id(node1) AS destination_id, similarity
-                ORDER BY similarity DESC
-                LIMIT $limit;
-                """
-                params = {
-                    "n_embedding": n_embedding,
-                    "threshold": self.threshold,
-                    "user_id": filters["user_id"],
-                    "agent_id": filters["agent_id"],
-                    "limit": limit,
-                }
-            else:
-                cypher_query = """
-                MATCH (n:Entity {user_id: $user_id})-[r]->(m:Entity)
-                WHERE n.embedding IS NOT NULL
-                WITH collect(n) AS nodes1, collect(m) AS nodes2, r
-                CALL node_similarity.cosine_pairwise("embedding", nodes1, nodes2)
-                YIELD node1, node2, similarity
-                WITH node1, node2, similarity, r
-                WHERE similarity >= $threshold
-                RETURN node1.name AS source, id(node1) AS source_id, type(r) AS relationship, id(r) AS relation_id, node2.name AS destination, id(node2) AS destination_id, similarity
-                UNION
-                MATCH (n:Entity {user_id: $user_id})<-[r]-(m:Entity)
-                WHERE n.embedding IS NOT NULL
-                WITH collect(n) AS nodes1, collect(m) AS nodes2, r
-                CALL node_similarity.cosine_pairwise("embedding", nodes1, nodes2)
-                YIELD node1, node2, similarity
-                WITH node1, node2, similarity, r
-                WHERE similarity >= $threshold
-                RETURN node2.name AS source, id(node2) AS source_id, type(r) AS relationship, id(r) AS relation_id, node1.name AS destination, id(node1) AS destination_id, similarity
-                ORDER BY similarity DESC
-                LIMIT $limit;
-                """
-                params = {
-                    "n_embedding": n_embedding,
-                    "threshold": self.threshold,
-                    "user_id": filters["user_id"],
-                    "limit": limit,
-                }
+            
 
-            ans = self.graph.query(cypher_query, params=params)
-            result_relations.extend(ans)
+            #todo Restore original qiuuery after patient embeddings
+        cypher_query = """
+                MATCH (n:Patient {uuid: $user_id})-[r]->(m:Entity)
+                RETURN m.name AS source, id(m) AS source_id, type(r) AS relationship, id(r) AS relation_id,
+                    n.name AS destination, id(n) AS destination_id
+                
+
+            """
+
+        ans = self.graph.query(cypher_query, params={"user_id": filters["user_id"]})
+        result_relations.extend(ans)
 
         return result_relations
 
@@ -405,129 +368,63 @@ class MemoryGraph:
         return results
 
     # added Entity label to all nodes for vector search to work
-    def _add_entities(self, to_be_added, filters, entity_type_map):
+    
+
+    def _add_entities(self, filters, tool_data):
         """Add the new entities to the graph. Merge the nodes if they already exist."""
-        user_id = filters["user_id"]
-        agent_id = filters.get("agent_id", None)
-        results = []
+        if tool_data.get("tool") == "add_symptom":
+            user_id = filters["user_id"]
+            symptom = tool_data["toolInput"]
 
-        for item in to_be_added:
-            # entities
-            source = item["source"]
-            destination = item["destination"]
-            relationship = item["relationship"]
+            # Find the patient node (with :Entity)
+            source_result = self.graph.query("""
+                MATCH (p:Patient {uuid: $uuid})
+                RETURN id(p) AS pid
+            """, {"uuid": user_id})
 
-            # types
-            source_type = entity_type_map.get(source, "__User__")
-            destination_type = entity_type_map.get(destination, "__User__")
+            if not source_result:
+                raise ValueError("Patient not found")
 
-            # embeddings
-            source_embedding = self.embedding_model.embed(source)
-            dest_embedding = self.embedding_model.embed(destination)
+            source_id = source_result[0]["pid"]
 
-            # search for the nodes with the closest embeddings
-            source_node_search_result = self._search_source_node(source_embedding, filters, threshold=0.9)
-            destination_node_search_result = self._search_destination_node(dest_embedding, filters, threshold=0.9)
+            # Add the Symptom node and relationship (with :Entity)
+            cypher = f"""
+                MATCH (p:Patient)
+                WHERE id(p) = $source_id
+                MERGE (s:Symptom:Entity {{
+                    name: $name,
+                    severity: $severity,
+                    duration: $duration,
+                    relievingFactors: $relievingFactors,
+                    triggers: $triggers,
+                    treatmentAndMedication: $treatmentAndMedication,
+                    user_id: $user_id
+                    
+                }})
+                ON CREATE SET s.created = timestamp(), s.embedding = $embedding
+                MERGE (p)-[r:EXPERIENCES]->(s)
+                ON CREATE SET r.created = timestamp()
+                RETURN p.uuid AS patient_uuid, type(r) AS relationship, s.name AS symptom
+            """
 
-            # Prepare agent_id for node creation
-            agent_id_clause = ""
-            if agent_id:
-                agent_id_clause = ", agent_id: $agent_id"
+            # Embed the symptom name
+            embedding = self.embedding_model.embed(symptom["name"])
 
-            # TODO: Create a cypher query and common params for all the cases
-            if not destination_node_search_result and source_node_search_result:
-                cypher = f"""
-                    MATCH (source:Entity)
-                    WHERE id(source) = $source_id
-                    MERGE (destination:{destination_type}:Entity {{name: $destination_name, user_id: $user_id{agent_id_clause}}})
-                    ON CREATE SET
-                        destination.created = timestamp(),
-                        destination.embedding = $destination_embedding,
-                        destination:Entity
-                    MERGE (source)-[r:{relationship}]->(destination)
-                    ON CREATE SET 
-                        r.created = timestamp()
-                    RETURN source.name AS source, type(r) AS relationship, destination.name AS target
-                    """
-
-                params = {
-                    "source_id": source_node_search_result[0]["id(source_candidate)"],
-                    "destination_name": destination,
-                    "destination_embedding": dest_embedding,
-                    "user_id": user_id,
-                }
-                if agent_id:
-                    params["agent_id"] = agent_id
-
-            elif destination_node_search_result and not source_node_search_result:
-                cypher = f"""
-                    MATCH (destination:Entity)
-                    WHERE id(destination) = $destination_id
-                    MERGE (source:{source_type}:Entity {{name: $source_name, user_id: $user_id{agent_id_clause}}})
-                    ON CREATE SET
-                        source.created = timestamp(),
-                        source.embedding = $source_embedding,
-                        source:Entity
-                    MERGE (source)-[r:{relationship}]->(destination)
-                    ON CREATE SET 
-                        r.created = timestamp()
-                    RETURN source.name AS source, type(r) AS relationship, destination.name AS target
-                    """
-
-                params = {
-                    "destination_id": destination_node_search_result[0]["id(destination_candidate)"],
-                    "source_name": source,
-                    "source_embedding": source_embedding,
-                    "user_id": user_id,
-                }
-                if agent_id:
-                    params["agent_id"] = agent_id
-
-            elif source_node_search_result and destination_node_search_result:
-                cypher = f"""
-                    MATCH (source:Entity)
-                    WHERE id(source) = $source_id
-                    MATCH (destination:Entity)
-                    WHERE id(destination) = $destination_id
-                    MERGE (source)-[r:{relationship}]->(destination)
-                    ON CREATE SET 
-                        r.created_at = timestamp(),
-                        r.updated_at = timestamp()
-                    RETURN source.name AS source, type(r) AS relationship, destination.name AS target
-                    """
-                params = {
-                    "source_id": source_node_search_result[0]["id(source_candidate)"],
-                    "destination_id": destination_node_search_result[0]["id(destination_candidate)"],
-                    "user_id": user_id,
-                }
-                if agent_id:
-                    params["agent_id"] = agent_id
-
-            else:
-                cypher = f"""
-                    MERGE (n:{source_type}:Entity {{name: $source_name, user_id: $user_id{agent_id_clause}}})
-                    ON CREATE SET n.created = timestamp(), n.embedding = $source_embedding, n:Entity
-                    ON MATCH SET n.embedding = $source_embedding
-                    MERGE (m:{destination_type}:Entity {{name: $dest_name, user_id: $user_id{agent_id_clause}}})
-                    ON CREATE SET m.created = timestamp(), m.embedding = $dest_embedding, m:Entity
-                    ON MATCH SET m.embedding = $dest_embedding
-                    MERGE (n)-[rel:{relationship}]->(m)
-                    ON CREATE SET rel.created = timestamp()
-                    RETURN n.name AS source, type(rel) AS relationship, m.name AS target
-                    """
-                params = {
-                    "source_name": source,
-                    "dest_name": destination,
-                    "source_embedding": source_embedding,
-                    "dest_embedding": dest_embedding,
-                    "user_id": user_id,
-                }
-                if agent_id:
-                    params["agent_id"] = agent_id
+            params = {
+                "source_id": source_id,
+                "name": symptom["name"],
+                "severity": symptom["severity"],
+                "duration": symptom["duration"],
+                "relievingFactors": symptom["relievingFactors"],
+                "triggers": symptom["triggers"],
+                "treatmentAndMedication": symptom["treatmentAndMedication"],
+                "user_id": user_id,
+                "embedding": embedding,
+            }
+            
 
             result = self.graph.query(cypher, params=params)
-            results.append(result)
-        return results
+            return result
 
     def _remove_spaces_from_entities(self, entity_list):
         for item in entity_list:
