@@ -458,6 +458,35 @@ class MemoryGraph:
                 "embedding": embedding,
             }
 
+        elif tool_data.get("tool") == "add_treatment":
+            treatment = tool_data["toolInput"]
+            embedding = self.embedding_model.embed(treatment["name"])
+            cypher = """
+                MATCH (p:Patient)
+                WHERE id(p) = $source_id
+                MERGE (t:Treatment:Entity {
+                    name: $name,
+                    startDate: $startDate,
+                    endDate: $endDate,
+                    location: $location,
+                    sideEffects: $sideEffects,
+                    notes: $notes,
+                })
+                SET t.created = timestamp(), t.embedding = $embedding
+                CREATE (p)-[r:RECEIVED_TREATMENT]->(t)
+                SET r.created = timestamp()
+                RETURN p.uuid AS patient_uuid, type(r) AS relationship, t.name AS treatment
+            """
+            params = {
+                "source_id": source_id,
+                "name": treatment["name"],
+                "startDate": treatment["startDate"],
+                "endDate": treatment["endDate"],
+                "location": treatment["location"],
+                "sideEffects": treatment["sideEffects"],
+                "notes": treatment["notes"],
+                "embedding": embedding,
+            }    
         else:
             raise ValueError(f"Unsupported tool: {tool}")
 
