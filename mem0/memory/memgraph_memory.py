@@ -464,13 +464,13 @@ class MemoryGraph:
             cypher = """
                 MATCH (p:Patient)
                 WHERE id(p) = $source_id
-                MERGE (t:Treatment:Entity {
+                MERGE (t:Treatment{
                     name: $name,
                     startDate: $startDate,
                     endDate: $endDate,
                     location: $location,
                     sideEffects: $sideEffects,
-                    notes: $notes,
+                    notes: $notes
                 })
                 SET t.created = timestamp(), t.embedding = $embedding
                 CREATE (p)-[r:RECEIVED_TREATMENT]->(t)
