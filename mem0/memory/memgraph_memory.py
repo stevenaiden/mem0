@@ -287,7 +287,8 @@ class MemoryGraph:
 
             #todo Restore original qiuuery after patient embeddings
         cypher_query = """
-                MATCH (n:Patient {uuid: $user_id})-[r]->(m:Entity)
+                MATCH (n:Patient {uuid: $user_id})-[r]->(m)
+                WHERE m.embedding IS NOT NULL
                 RETURN m.name AS source, id(m) AS source_id, type(r) AS relationship, id(r) AS relation_id,
                     n.name AS destination, id(n) AS destination_id
                 
@@ -372,43 +373,42 @@ class MemoryGraph:
 
     def _add_entities(self, filters, tool_data):
         """Add the new entities to the graph. Merge the nodes if they already exist."""
-        if tool_data.get("tool") == "add_symptom":
-            user_id = filters["user_id"]
+        user_id = filters["user_id"]
+
+        # Find the patient node
+        source_result = self.graph.query("""
+            MATCH (p:Patient {uuid: $uuid})
+            RETURN id(p) AS pid
+        """, {"uuid": user_id})
+
+        if not source_result:
+            raise ValueError("Patient not found")
+
+        source_id = source_result[0]["pid"]
+
+        tool = tool_data.get("tool")
+
+        if tool == "add_symptom":
             symptom = tool_data["toolInput"]
 
-            # Find the patient node (with :Entity)
-            source_result = self.graph.query("""
-                MATCH (p:Patient {uuid: $uuid})
-                RETURN id(p) AS pid
-            """, {"uuid": user_id})
+            embedding = self.embedding_model.embed(symptom["name"])
 
-            if not source_result:
-                raise ValueError("Patient not found")
-
-            source_id = source_result[0]["pid"]
-
-            # Add the Symptom node and relationship (with :Entity)
             cypher = f"""
                 MATCH (p:Patient)
                 WHERE id(p) = $source_id
-                MERGE (s:Symptom:Entity {{
+                MERGE (s:Symptom {{
                     name: $name,
                     severity: $severity,
                     duration: $duration,
                     relievingFactors: $relievingFactors,
                     triggers: $triggers,
-                    treatmentAndMedication: $treatmentAndMedication,
-                    user_id: $user_id
-                    
+                    treatmentAndMedication: $treatmentAndMedication
                 }})
-                ON CREATE SET s.created = timestamp(), s.embedding = $embedding
-                MERGE (p)-[r:EXPERIENCES]->(s)
-                ON CREATE SET r.created = timestamp()
+                SET s.created = timestamp(), s.embedding = $embedding
+                CREATE (p)-[r:EXPERIENCES]->(s)
+                SET r.created = timestamp()
                 RETURN p.uuid AS patient_uuid, type(r) AS relationship, s.name AS symptom
             """
-
-            # Embed the symptom name
-            embedding = self.embedding_model.embed(symptom["name"])
 
             params = {
                 "source_id": source_id,
@@ -418,13 +418,52 @@ class MemoryGraph:
                 "relievingFactors": symptom["relievingFactors"],
                 "triggers": symptom["triggers"],
                 "treatmentAndMedication": symptom["treatmentAndMedication"],
-                "user_id": user_id,
                 "embedding": embedding,
             }
-            
 
-            result = self.graph.query(cypher, params=params)
-            return result
+        elif tool == "add_meal":
+            food = tool_data["toolInput"]
+
+            embedding = self.embedding_model.embed(food["name"])
+
+            cypher = f"""
+                MATCH (p:Patient)
+                WHERE id(p) = $source_id
+                CREATE (m:Meal {{
+                    name: $name,
+                    location: $location,
+                    ateWith: $ateWith,
+                    quality: $quality,
+                    finished: $finished,
+                    additions: $additions,
+                    score: $score,
+                    calories: $calories
+                }})
+                SET m.created = timestamp(), m.embedding = $embedding
+                CREATE (p)-[r:HAS_MEAL]->(m)
+                SET r.created = timestamp()
+                RETURN p.uuid AS patient_uuid, type(r) AS relationship, m.name AS meal
+            """
+
+            params = {
+                "source_id": source_id,
+                "name": food["name"],
+                "location": food["location"],
+                "ateWith": food["ateWith"],
+                "quality": food["quality"],
+                "finished": food["finished"],
+                "additions": food.get("additions", ""),
+                "score": food.get("score", 0),
+                "calories": food.get("calories", 0),
+                "embedding": embedding,
+            }
+
+        else:
+            raise ValueError(f"Unsupported tool: {tool}")
+
+        result = self.graph.query(cypher, params=params)
+        return result
+
 
     def _remove_spaces_from_entities(self, entity_list):
         for item in entity_list:
