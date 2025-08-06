@@ -1,5 +1,5 @@
 import logging
-
+from datetime import datetime, timezone
 from mem0.memory.utils import format_entities
 
 try:
@@ -281,7 +281,6 @@ class MemoryGraph:
         result_relations = []
 
             
-
             # Build query based on whether agent_id is provided
             
 
@@ -291,8 +290,6 @@ class MemoryGraph:
                 WHERE m.embedding IS NOT NULL
                 RETURN m.name AS source, id(m) AS source_id, type(r) AS relationship, id(r) AS relation_id,
                     n.name AS destination, id(n) AS destination_id
-                
-
             """
 
         ans = self.graph.query(cypher_query, params={"user_id": filters["user_id"]})
@@ -370,10 +367,11 @@ class MemoryGraph:
 
     # added Entity label to all nodes for vector search to work
     
-
     def _add_entities(self, filters, tool_data):
         """Add the new entities to the graph. Merge the nodes if they already exist."""
         user_id = filters["user_id"]
+
+        current_time = datetime.now(timezone.utc).isoformat(timespec='microseconds') + 'Z'
 
         # Find the patient node
         source_result = self.graph.query("""
@@ -381,118 +379,32 @@ class MemoryGraph:
             RETURN id(p) AS pid
         """, {"uuid": user_id})
 
+        source_id=None
         if not source_result:
-            raise ValueError("Patient not found")
-
-        source_id = source_result[0]["pid"]
-
+            # Create the patient node with uuid
+            create_result = self.graph.query("""
+                CREATE (p:Patient:Entity {uuid: $uuid , createdAt: $createdAt})
+                RETURN id(p) AS pid
+            """, {"uuid": user_id,"createdAt": current_time})
+            source_id = create_result[0]["pid"]
+        else:        
+            source_id = source_result[0]["pid"]
+        
         tool = tool_data.get("tool")
-
         if tool == "add_symptom":
-            symptom = tool_data["toolInput"]
-
-            embedding = self.embedding_model.embed(symptom["name"])
-
-            cypher = f"""
-                MATCH (p:Patient)
-                WHERE id(p) = $source_id
-                MERGE (s:Symptom {{
-                    name: $name,
-                    severity: $severity,
-                    duration: $duration,
-                    relievingFactors: $relievingFactors,
-                    triggers: $triggers,
-                    treatmentAndMedication: $treatmentAndMedication
-                }})
-                SET s.created = timestamp(), s.embedding = $embedding
-                CREATE (p)-[r:EXPERIENCES]->(s)
-                SET r.created = timestamp()
-                RETURN p.uuid AS patient_uuid, type(r) AS relationship, s.name AS symptom
-            """
-
-            params = {
-                "source_id": source_id,
-                "name": symptom["name"],
-                "severity": symptom["severity"],
-                "duration": symptom["duration"],
-                "relievingFactors": symptom["relievingFactors"],
-                "triggers": symptom["triggers"],
-                "treatmentAndMedication": symptom["treatmentAndMedication"],
-                "embedding": embedding,
-            }
+            params, cypher = add_symptom(self, source_id, tool_data)
 
         elif tool == "add_meal":
-            food = tool_data["toolInput"]
-
-            embedding = self.embedding_model.embed(food["name"])
-
-            cypher = f"""
-                MATCH (p:Patient)
-                WHERE id(p) = $source_id
-                CREATE (m:Meal {{
-                    name: $name,
-                    location: $location,
-                    ateWith: $ateWith,
-                    quality: $quality,
-                    finished: $finished,
-                    additions: $additions,
-                    score: $score,
-                    calories: $calories
-                }})
-                SET m.created = timestamp(), m.embedding = $embedding
-                CREATE (p)-[r:HAS_MEAL]->(m)
-                SET r.created = timestamp()
-                RETURN p.uuid AS patient_uuid, type(r) AS relationship, m.name AS meal
-            """
-
-            params = {
-                "source_id": source_id,
-                "name": food["name"],
-                "location": food["location"],
-                "ateWith": food["ateWith"],
-                "quality": food["quality"],
-                "finished": food["finished"],
-                "additions": food.get("additions", ""),
-                "score": food.get("score", 0),
-                "calories": food.get("calories", 0),
-                "embedding": embedding,
-            }
+            params, cypher = add_meal(self, source_id, tool_data)
 
         elif tool_data.get("tool") == "add_treatment":
-            treatment = tool_data["toolInput"]
-            embedding = self.embedding_model.embed(treatment["name"])
-            cypher = """
-                MATCH (p:Patient)
-                WHERE id(p) = $source_id
-                MERGE (t:Treatment{
-                    name: $name,
-                    startDate: $startDate,
-                    endDate: $endDate,
-                    location: $location,
-                    sideEffects: $sideEffects,
-                    notes: $notes
-                })
-                SET t.created = timestamp(), t.embedding = $embedding
-                CREATE (p)-[r:RECEIVED_TREATMENT]->(t)
-                SET r.created = timestamp()
-                RETURN p.uuid AS patient_uuid, type(r) AS relationship, t.name AS treatment
-            """
-            params = {
-                "source_id": source_id,
-                "name": treatment["name"],
-                "startDate": treatment["startDate"],
-                "endDate": treatment["endDate"],
-                "location": treatment["location"],
-                "sideEffects": treatment["sideEffects"],
-                "notes": treatment["notes"],
-                "embedding": embedding,
-            }    
+            params, cypher = add_treatment(self, source_id, tool_data)
         else:
             raise ValueError(f"Unsupported tool: {tool}")
-
+        
+        params["createdAt"] = current_time
         result = self.graph.query(cypher, params=params)
         return result
-
 
     def _remove_spaces_from_entities(self, entity_list):
         for item in entity_list:
@@ -593,3 +505,100 @@ class MemoryGraph:
             "index_exists": index_exists,
             "vector_index_exists": vector_index_exists
         }
+
+def add_symptom(self,source_id,tool_data):
+    symptom = tool_data["toolInput"]
+    embedding = self.embedding_model.embed(str(symptom))
+    cypher = f"""       
+        MATCH (p:Patient)
+        WHERE id(p) = $source_id
+        MERGE (s:Symptom {{
+            name: $name,
+            severity: $severity,
+            duration: $duration,
+            relievingFactors: $relievingFactors,
+            triggers: $triggers,
+            treatmentAndMedication: $treatmentAndMedication
+        }})
+        SET s.createdAt = $createdAt, s.embedding = $embedding
+        CREATE (p)-[r:EXPERIENCES]->(s)
+        SET r.createdAt = $createdAt
+        RETURN p.uuid AS patient_uuid, type(r) AS relationship, s.name AS symptom
+    """
+    params = {
+        "source_id": source_id,
+        "name": symptom["name"],
+        "severity": symptom["severity"],
+        "duration": symptom["duration"],
+        "relievingFactors": symptom["relievingFactors"],
+        "triggers": symptom["triggers"],
+        "treatmentAndMedication": symptom["treatmentAndMedication"],
+        "embedding": embedding,
+    }
+    return params,cypher
+   
+def add_meal(self,source_id,tool_data):
+    food = tool_data["toolInput"]
+    embedding = self.embedding_model.embed(str(food))
+    cypher = f"""
+        MATCH (p:Patient)
+        WHERE id(p) = $source_id
+        CREATE (m:Meal {{
+            name: $name,
+            location: $location,
+            ateWith: $ateWith,
+            quality: $quality,
+            finished: $finished,
+            additions: $additions,
+            score: $score,
+            calories: $calories
+        }})
+        SET m.createdAt = $createdAt, m.embedding = $embedding
+        CREATE (p)-[r:HAS_MEAL]->(m)
+        SET r.createdAt = $createdAt
+        RETURN p.uuid AS patient_uuid, type(r) AS relationship, m.name AS meal
+        """
+    params = {
+        "source_id": source_id,
+        "name": food["name"],
+        "location": food["location"],
+        "ateWith": food["ateWith"],
+        "quality": food["quality"],
+        "finished": food["finished"],
+        "additions": food.get("additions", ""),
+        "score": food.get("score", 0),
+        "calories": food.get("calories", 0),
+        "embedding": embedding,
+    }
+    return params, cypher
+
+def add_treatment(self,source_id,tool_data):
+    treatment = tool_data["toolInput"]
+    embedding = self.embedding_model.embed(str(treatment))
+    cypher = """
+        MATCH (p:Patient)
+        WHERE id(p) = $source_id
+        MERGE (t:Treatment{
+            name: $name,
+            startDate: $startDate,
+            endDate: $endDate,
+            location: $location,
+            sideEffects: $sideEffects,
+            notes: $notes
+        })
+        SET t.createdAt = $createdAt, t.embedding = $embedding
+        CREATE (p)-[r:RECEIVED_TREATMENT]->(t)
+        SET r.createdAt = $createdAt
+        RETURN p.uuid AS patient_uuid, type(r) AS relationship, t.name AS treatment
+        """
+    params = {
+        "source_id": source_id,
+        "name": treatment["name"],
+        "startDate": treatment["startDate"],
+        "endDate": treatment["endDate"],
+        "location": treatment["location"],
+        "sideEffects": treatment["sideEffects"],
+        "notes": treatment["notes"],
+        "embedding": embedding,
+    }        
+    return params, cypher 
