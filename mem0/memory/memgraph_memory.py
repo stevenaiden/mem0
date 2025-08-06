@@ -1,6 +1,14 @@
 import logging
 from datetime import datetime, timezone
 from mem0.memory.utils import format_entities
+from openai import OpenAI
+from neo4j import GraphDatabase
+import types    
+import os
+import json
+import re
+
+
 
 try:
     from langchain_memgraph.graphs.memgraph import Memgraph
@@ -104,39 +112,167 @@ class MemoryGraph:
 
         return {"added_entities": added_entities}
 
-    def search(self, query, filters, limit=100):
-        """
-        Search for memories and related graph data.
+    def search(self, query, filters, user_id, top_k=5, limit=5):
+        print(":gear:  Using Patient-centered entity-based vector search...")
+        
+        try:
+            # Step 1: Extract entities from the query using LLM
+            entities = self.extract_entities_with_llm(query, user_id)
+            print(f":white_check_mark: User id: {user_id}")
+            if not entities:
+                print(":warning: No entities extracted, falling back to full query search")
+                entities = [query.lower()]
+            
+            # Step 2: Get embeddings for each entity
+            entity_embeddings = {}
+            for entity in entities:
+                try:
+                    entity_embeddings[entity] = self.embedding_model.embed(entity)
+                except Exception as e:
+                    print(f":warning: Failed to embed entity '{entity}': {e}")
+                    continue
+            
+            if not entity_embeddings:
+                print(":x: No valid entity embeddings, falling back to text search")
+                raise Exception("No entity embeddings available")
+            
+            # Step 3: Create direct connection to database
+            driver = GraphDatabase.driver("bolt://localhost:7687", auth=("memgraph", "memgraph"))
+            
+            with driver.session() as session:
+                # Start from Patient node and traverse relationships to find related nodes
+                cypher = """
+                MATCH (patient:Patient {user_id: $user_id})-[r]-(related_node)
+                WHERE related_node.embedding IS NOT NULL
+                RETURN related_node.embedding_text AS text,
+                       related_node.user_id AS user_id,
+                       related_node.embedding AS embedding,
+                       labels(related_node) AS node_type,
+                       related_node.name AS node_name,
+                       id(related_node) AS node_id,
+                       type(r) AS relationship_type
+                """
+                result = session.run(cypher, parameters={"user_id": user_id})
+                
+                # Step 4: Calculate entity-based similarities
+                node_scores = {}
+                
+                for record in result:
+                    node_id = record["node_id"]
+                    node_embedding = record["embedding"]
+                    node_text = (record["text"] or "").lower()  # Handle None values
+                    
+                    # Skip nodes with no text or embedding
+                    if not node_text or not node_embedding:
+                        continue
+                    
+                    # Calculate similarity for each entity against this node
+                    max_entity_score = 0.0
+                    best_matching_entity = None
+                    
+                    for entity, entity_embedding in entity_embeddings.items():
+                        # Calculate cosine similarity between entity and node
+                        similarity = self.calculate_cosine_similarity(entity_embedding, node_embedding)
+                        
+                        # Boost score if entity appears in node text
+                        text_boost = 1.0
+                        if entity in node_text:
+                            text_boost = 1.2
+                            print(f":mag: Text match boost for entity '{entity}' in node")
+                        
+                        final_score = similarity * text_boost
+                        
+                        if final_score > max_entity_score:
+                            max_entity_score = final_score
+                            best_matching_entity = entity
+                    
+                    # Store the best score for this node
+                    if max_entity_score > 0:
+                        node_scores[node_id] = {
+                            "text": record["text"],
+                            "score": max_entity_score,
+                            "node_type": record["node_type"][0] if record["node_type"] else "Unknown",
+                            "node_name": record["node_name"],
+                            "matching_entity": best_matching_entity,
+                            "relationship_type": record["relationship_type"]
+                        }
+                
+                # Step 5: Sort and return top results
+                matches = list(node_scores.values())
+                matches.sort(key=lambda x: x["score"], reverse=True)
+                matches = matches[:top_k]
+                
+                print(f":white_check_mark: Found {len(matches)} Patient-related matches")
+                for i, match in enumerate(matches[:3], 1):  # Show top 3 for debugging
+                    print(f"  {i}. Score: {match['score']:.3f} | Rel: {match['relationship_type']} | Entity: {match['matching_entity']} | Text: {match['text'][:100]}...")
+                
+                driver.close()
+                return matches
+                
+        except Exception as e:
+            print(f":warning:  Entity-based vector search error: {e}")
+            # Fallback to Patient-centered entity-based text search
+            print(":arrows_counterclockwise: Falling back to Patient-centered text search...")
+            
+            try:
+                # Try to extract entities for text search too
+                entities = self.extract_entities_with_llm(query, user_id)
+                if not entities:
+                    entities = [query.lower()]
+                
+                driver = GraphDatabase.driver("bolt://localhost:7687", auth=("memgraph", "memgraph"))
+                with driver.session() as session:
+                    all_matches = []
+                    
+                    # Search for each entity in Patient's related nodes
+                    for entity in entities:
+                        cypher = """
+                        MATCH (patient:Patient {user_id: $user_id})-[r]-(related_node)
+                        WHERE related_node.embedding_text IS NOT NULL
+                        AND toLower(related_node.embedding_text) CONTAINS toLower($entity)
+                        RETURN related_node.embedding_text AS text,
+                               labels(related_node) AS node_type,
+                               related_node.name AS node_name,
+                               0.6 AS similarity,
+                               $entity AS matching_entity,
+                               id(related_node) AS node_id,
+                               type(r) AS relationship_type
+                        """
+                        result = session.run(cypher, parameters={
+                            "entity": entity,
+                            "user_id": user_id
+                        })
+                        
+                        for record in result:
+                            all_matches.append({
+                                "text": record["text"],
+                                "score": record["similarity"],
+                                "node_type": record["node_type"][0] if record["node_type"] else "Unknown",
+                                "node_name": record["node_name"],
+                                "matching_entity": record["matching_entity"],
+                                "node_id": record["node_id"],
+                                "relationship_type": record["relationship_type"]
+                            })
+                    
+                    # Remove duplicates based on node_id and take top_k
+                    unique_matches = {}
+                    for match in all_matches:
+                        node_id = match["node_id"]
+                        if node_id not in unique_matches or match["score"] > unique_matches[node_id]["score"]:
+                            unique_matches[node_id] = match
+                    
+                    matches = list(unique_matches.values())
+                    matches.sort(key=lambda x: x["score"], reverse=True)
+                    matches = matches[:top_k]
+                    
+                    print(f":white_check_mark: Found {len(matches)} matches with Patient-centered text search")
+                    driver.close()
+                    return matches
+                    
+            except Exception as fallback_error:
+                print(f":x: Entity-based fallback search also failed: {fallback_error}")
+                return []
 
-        Args:
-            query (str): Query to search for.
-            filters (dict): A dictionary containing filters to be applied during the search.
-            limit (int): The maximum number of nodes and relationships to retrieve. Defaults to 100.
-
-        Returns:
-            dict: A dictionary containing:
-                - "contexts": List of search results from the base data store.
-                - "entities": List of related graph data based on the query.
-        """
-        entity_type_map = self._retrieve_nodes_from_data(query, filters)
-        search_output = self._search_graph_db(node_list=list(entity_type_map.keys()), filters=filters)
-
-        if not search_output:
-            return []
-
-        search_outputs_sequence = [
-            [item["source"], item["relationship"], item["destination"]] for item in search_output
-        ]
-        bm25 = BM25Okapi(search_outputs_sequence)
-
-        tokenized_query = query.split(" ")
-        reranked_results = bm25.get_top_n(tokenized_query, search_outputs_sequence, n=5)
-
-        search_results = []
-        for item in reranked_results:
-            search_results.append({"source": item[0], "relationship": item[1], "destination": item[2]})
-
-        logger.info(f"Returned {len(search_results)} search results")
 
         return search_results
 
@@ -202,6 +338,104 @@ class MemoryGraph:
 
         return final_results
 
+
+    def extract_entities_with_llm(self, query, user_id):
+        """Extract relevant entities from the query using OpenAI GPT"""
+        print(f":brain: Extracting entities from query: '{query}'")
+        
+        # Enhanced medical prompt based on your search_mem0.py example
+        enhanced_prompt = f"""You are a medical data assistant specialized in extracting entities from healthcare queries.
+        IMPORTANT RULES:
+        1. If the query asks about MEDICATIONS/DRUGS/PRESCRIPTIONS, always include "medications" as an entity
+        2. If the query asks about SYMPTOMS/PAIN/CONDITIONS, always include "symptoms" as an entity  
+        3. If the query asks about MEALS/FOOD/DIET, always include "meals" as an entity
+        4. If the query asks about OBSERVATIONS/TESTS/RESULTS/VITALS, always include "observations" as an entity
+        5. If the query asks about ALLERGIES, always include "allergies" as an entity
+        6. If the query asks about DIAGNOSES/CONDITIONS, always include "diagnoses" as an entity
+        7. If user message contains self reference such as 'I', 'me', 'my' etc. then use {user_id} as the source entity
+        8. Extract BOTH the target entity (what user is asking about) AND the subject entity (who it relates to)
+
+        EXAMPLES:
+        - "What medications is the patient taking?" → Extract: ["medications", "patient"]
+        - "Show me my symptoms" → Extract: ["symptoms"]  
+        - "Tell me about my meals" → Extract: ["meals"]
+        - "What are the patient's test results?" → Extract: ["observations", "patient"]
+        - "knee pain" → Extract: ["symptoms", "knee_pain"]
+        - "diabetes medication" → Extract: ["medications", "diabetes"]
+        - "blood pressure readings" → Extract: ["observations", "blood_pressure"]
+        - "Tell me about my right knee pain" → Extract: ["symptoms", "right_knee_pain"]
+
+
+        Extract all relevant entities from the text. Return ONLY a JSON array of strings.
+        DO NOT answer the question itself. DO NOT include explanations.
+
+        Query: "{query}"
+
+        Entities:"""
+
+        try:
+            client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+            
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "You are an expert medical entity extraction system. Return only JSON arrays."},
+                    {"role": "user", "content": enhanced_prompt}
+                ],
+                temperature=0.1,
+                max_tokens=200
+            )
+            
+            content = response.choices[0].message.content.strip()
+            print(f":mag: LLM Response: {content}")
+            
+            # Try to parse as JSON
+            try:
+                entities = json.loads(content)
+                if isinstance(entities, list):
+                    entities = [str(entity).strip().lower() for entity in entities if entity]
+                    print(f":white_check_mark: Extracted entities: {entities}")
+                    return entities
+            except json.JSONDecodeError:
+                pass
+            
+            # Fallback: extract using regex if JSON parsing fails
+            matches = re.findall(r'"([^"]+)"', content)
+            if matches:
+                entities = [entity.strip().lower() for entity in matches]
+                print(f":arrows_counterclockwise: Regex extracted entities: {entities}")
+                return entities
+            
+            # Final fallback: use original query terms
+            entities = [word.strip().lower() for word in query.split() if len(word) > 2]
+            print(f":warning: Using fallback word extraction: {entities}")
+            return entities
+            
+        except Exception as e:
+            print(f":x: Entity extraction error: {e}")
+            # Fallback to simple word extraction
+            entities = [word.strip().lower() for word in query.split() if len(word) > 2]
+            print(f":arrows_counterclockwise: Using simple word fallback: {entities}")
+            return entities
+
+    def calculate_cosine_similarity(self, vec1, vec2):
+        """Calculate cosine similarity between two vectors"""
+        import numpy as np
+        
+        # Convert to numpy arrays if they aren't already
+        vec1 = np.array(vec1)
+        vec2 = np.array(vec2)
+        
+        # Calculate cosine similarity
+        dot_product = np.dot(vec1, vec2)
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        
+        return dot_product / (norm1 * norm2)
+        
     def _retrieve_nodes_from_data(self, data, filters):
         """Extracts all the entities mentioned in the query."""
         _tools = [EXTRACT_ENTITIES_TOOL]

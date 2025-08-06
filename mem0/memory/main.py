@@ -644,7 +644,7 @@ class Memory(MemoryBase):
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future_graph_entities = (
-                executor.submit(self.graph.search, query, effective_filters, limit) if self.enable_graph else None
+                executor.submit(self.graph.search, query, effective_filters, user_id, limit) if self.enable_graph else None
             )
 
             concurrent.futures.wait(
@@ -1433,7 +1433,7 @@ class AsyncMemory(MemoryBase):
         user_id: Optional[str] = None,
         agent_id: Optional[str] = None,
         run_id: Optional[str] = None,
-        limit: int = 100,
+        limit: int = 5,
         filters: Optional[Dict[str, Any]] = None,
         threshold: Optional[float] = None,
     ):
