@@ -188,9 +188,7 @@ class Weaviate(VectorStoreBase):
             results.append(
                 OutputData(
                     id=str(obj.uuid),
-                    score=1
-                    if obj.metadata.distance is None
-                    else 1 - obj.metadata.distance,  # Convert distance to score
+                    score=obj.metadata.score,  # Convert distance to score
                     payload=payload,
                 )
             )
