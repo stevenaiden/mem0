@@ -165,7 +165,20 @@ class Weaviate(VectorStoreBase):
         filter_conditions = []
         if filters:
             for key, value in filters.items():
-                if value and key in ["user_id", "agent_id", "run_id"]:
+                #if value and key in ["user_id", "agent_id", "run_id"]:
+                if isinstance(value, dict):
+                    # Comparison operators
+                    if "lt" in value:
+                        filter_conditions.append(Filter.by_property(key).less_than(value["lt"]))
+                    if "lte" in value:
+                        filter_conditions.append(Filter.by_property(key).less_or_equal(value["lte"]))
+                    if "gt" in value:
+                        filter_conditions.append(Filter.by_property(key).greater_than(value["gt"]))
+                    if "gte" in value:
+                        filter_conditions.append(Filter.by_property(key).greater_or_equal(value["gte"]))
+                    if "eq" in value:
+                        filter_conditions.append(Filter.by_property(key).equal(value["eq"]))
+                else:        
                     filter_conditions.append(Filter.by_property(key).equal(value))
         combined_filter = Filter.all_of(filter_conditions) if filter_conditions else None
         response = collection.query.hybrid(
